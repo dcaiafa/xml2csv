@@ -3,125 +3,238 @@ package main
 import (
 	"bytes"
 	"encoding/csv"
+	"encoding/json"
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"github.com/robertkrimen/otto"
 	"gopkg.in/xmlpath.v2"
 	"io"
 	"os"
 	"strings"
 )
 
-func run(xml, out, path, include, exclude string, cols []string) error {
+type transformExpression struct {
+	XPath string `json:"xpath"`
+	Eval  string `json:"eval"`
+
+	xpath *xmlpath.Path
+}
+
+type transformColumn struct {
+	Name string `json:"name"`
+	transformExpression
+}
+
+type transform struct {
+	Path    string                `json:"path"`
+	Include []transformExpression `json:"include"`
+	Exclude []transformExpression `json:"exclude"`
+	Columns []transformColumn     `json:"columns"`
+
+	path []string
+}
+
+func run(in, out, transformPath string) error {
 	var err error
 
 	switch {
-	case xml == "":
-		return fmt.Errorf("missing required parameter -xml")
+	case in == "":
+		return fmt.Errorf("missing required parameter -i")
 	case out == "":
-		return fmt.Errorf("missing required parameter -out")
-	case path == "":
-		return fmt.Errorf("missing required parameter -path")
-	case len(cols) == 0:
-		return fmt.Errorf("missing column xpath parameters")
+		return fmt.Errorf("missing required parameter -o")
+	case transformPath == "":
+		return fmt.Errorf("missing required parameter -t")
 	}
 
-	pathElements := strings.Split(path, "/")
-	if len(pathElements) < 2 && pathElements[0] != "" {
-		return fmt.Errorf("parameter -path is invalid")
+	transformFile, err := os.Open(transformPath)
+	if err != nil {
+		return fmt.Errorf("failed to open %v: %v", transformPath, err)
 	}
-	pathElements = pathElements[1:]
+	defer transformFile.Close()
 
-	if pathElements[len(pathElements)-1] == "" {
-		pathElements = pathElements[:len(pathElements)-1]
-		if len(pathElements) == 0 {
+	var t transform
+	err = json.NewDecoder(transformFile).Decode(&t)
+	if err != nil {
+		return fmt.Errorf("failed to parse json in %v: %v", transformPath, err)
+	}
+
+	t.path = strings.Split(t.Path, "/")
+	if len(t.path) < 2 && t.path[0] != "" {
+		return fmt.Errorf("Path field is invalid")
+	}
+	t.path = t.path[1:]
+
+	if t.path[len(t.path)-1] == "" {
+		t.path = t.path[:len(t.path)-1]
+		if len(t.path) == 0 {
 			return fmt.Errorf("parameter -path is invalid")
 		}
 	}
 
-	var includePath *xmlpath.Path
-	if include != "" {
-		includePath, err = xmlpath.Compile(include)
-		if err != nil {
-			return fmt.Errorf(
-				"parameter -include is not a valid XPath expression: %v", err)
+	for i := 0; i < len(t.Include); i++ {
+		if err = compile(&t.Include[i]); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < len(t.Exclude); i++ {
+		if err = compile(&t.Exclude[i]); err != nil {
+			return err
+		}
+	}
+	for i := 0; i < len(t.Columns); i++ {
+		if err = compile(&t.Columns[i].transformExpression); err != nil {
+			return err
 		}
 	}
 
-	var excludePath *xmlpath.Path
-	if exclude != "" {
-		excludePath, err = xmlpath.Compile(exclude)
-		if err != nil {
-			return fmt.Errorf(
-				"parameter -exclude is not a valid XPath expression: %v", err)
-		}
-	}
+	fmt.Println(t)
 
-	colHeaders := make([]string, len(cols))
-	colPaths := make([]*xmlpath.Path, len(cols))
-	for i, col := range cols {
-		elems := strings.SplitN(col, "=", 2)
-		if len(elems) != 2 {
-			return fmt.Errorf(
-				"positional parameter '%v' should be formatted as <header>=<xpath>",
-				col)
-		}
-
-		colHeaders[i] = strings.TrimSpace(elems[0])
-
-		colPath, err := xmlpath.Compile(elems[1])
-		if err != nil {
-			return fmt.Errorf(
-				"positional parameter '%v' is not a valid XPath expression: %v",
-				col, err)
-		}
-		colPaths[i] = colPath
-	}
-
-	xmlFile, err := os.Open(xml)
+	xmlFile, err := os.Open(in)
 	if err != nil {
-		return fmt.Errorf("failed to open %v: %v", xml, err)
+		return fmt.Errorf("failed to open %v: %v", in, err)
+	}
+	defer xmlFile.Close()
+
+	var writer io.Writer
+	if out != "" {
+		outFile, err := os.Create(out)
+		if err != nil {
+			return fmt.Errorf("failed to create %v: %v", out, err)
+		}
+		defer outFile.Close()
+		writer = outFile
+	} else {
+		writer = os.Stdout
 	}
 
-	writer := csv.NewWriter(os.Stdout)
-	writer.Write(colHeaders)
+	headers := make([]string, len(t.Columns))
+	for i := 0; i < len(headers); i++ {
+		headers[i] = t.Columns[i].Name
+	}
 
-	err = parse(xmlFile, pathElements, func(xml []byte) error {
+	jsvm := otto.New()
+
+	csvWriter := csv.NewWriter(writer)
+	csvWriter.Write(headers)
+
+	err = parse(xmlFile, t.path, func(xml []byte) error {
 		node, err := xmlpath.Parse(bytes.NewReader(xml))
 		if err != nil {
 			return fmt.Errorf("failed to parse xml: %v", err)
 		}
 
-		if includePath != nil && !includePath.Exists(node) {
+		include := len(t.Include) == 0
+		for i := 0; i < len(t.Include); i++ {
+			if include, err = evalBool(jsvm, node, &t.Include[i]); err != nil {
+				return fmt.Errorf("failed to eval include expression: %v", err)
+			}
+			if include {
+				break
+			}
+		}
+		if !include {
 			return nil
 		}
 
-		if excludePath != nil && excludePath.Exists(node) {
-			return nil
-		}
-
-		values := make([]string, len(colPaths))
-		for i, colPath := range colPaths {
-			value, ok := colPath.String(node)
-			if ok {
-				values[i] = strings.TrimSpace(value)
+		for i := 0; i < len(t.Exclude); i++ {
+			exclude, err := evalBool(jsvm, node, &t.Exclude[i])
+			if err != nil {
+				return fmt.Errorf("failed to eval exclude expression: %v", err)
+			}
+			if exclude {
+				return nil
 			}
 		}
 
-		err = writer.Write(values)
+		values := make([]string, len(t.Columns))
+		for i := 0; i < len(t.Columns); i++ {
+			value, err := evalString(jsvm, node, &t.Columns[i].transformExpression)
+			if err != nil {
+				return fmt.Errorf("failed to eval column expression: %v", err)
+			}
+			values[i] = strings.TrimSpace(value)
+		}
+
+		err = csvWriter.Write(values)
 		if err != nil {
 			return fmt.Errorf("failed to write to csv file: %v", err)
 		}
 		return nil
 	})
 
-	writer.Flush()
+	csvWriter.Flush()
 
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func compile(expr *transformExpression) error {
+	var err error
+	expr.xpath, err = xmlpath.Compile(expr.XPath)
+	if err != nil {
+		return fmt.Errorf("Failed to compile xpath expression '%v': %v", expr.XPath, err)
+	}
+	return nil
+}
+
+func eval(jsvm *otto.Otto, node *xmlpath.Node, expr *transformExpression) (otto.Value, error) {
+	emptyString, _ := otto.ToValue("")
+
+	nodeValue, ok := expr.xpath.String(node)
+	if !ok {
+		return emptyString, nil
+	}
+
+	if expr.Eval == "" {
+		stringVal, _ := otto.ToValue(nodeValue)
+		return stringVal, nil
+	}
+
+	jsvm.Set("v", nodeValue)
+	exprValue, err := jsvm.Run(expr.Eval)
+	if err != nil {
+		return emptyString,
+			fmt.Errorf("failed to evaluate javascript expr '%v': %v", expr.Eval, err)
+	}
+	return exprValue, nil
+}
+
+func evalBool(jsvm *otto.Otto, node *xmlpath.Node, expr *transformExpression) (bool, error) {
+	if expr.Eval == "" {
+		return expr.xpath.Exists(node), nil
+	}
+
+	exprValue, err := eval(jsvm, node, expr)
+	if err != nil {
+		return false, err
+	}
+
+	boolValue, err := exprValue.ToBoolean()
+	if err != nil {
+		return false,
+			fmt.Errorf("result of javascript expr '%v' doesn't evaluate to bool", expr.Eval)
+	}
+
+	return boolValue, nil
+}
+
+func evalString(jsvm *otto.Otto, node *xmlpath.Node, expr *transformExpression) (string, error) {
+	exprValue, err := eval(jsvm, node, expr)
+	if err != nil {
+		return "", err
+	}
+
+	stringValue, err := exprValue.ToString()
+	if err != nil {
+		return "",
+			fmt.Errorf("result of javascript expr '%v' doesn't evaluate to string", expr.Eval)
+	}
+
+	return stringValue, nil
 }
 
 func parse(xmlFile io.Reader, path []string, emit func(xml []byte) error) error {
@@ -187,16 +300,14 @@ func sliceEq(a, b []string) bool {
 
 func main() {
 	var (
-		xml     = flag.String("xml", "", "")
-		out     = flag.String("out", "", "")
-		path    = flag.String("path", "", "")
-		include = flag.String("include", "", "")
-		exclude = flag.String("exclude", "", "")
+		in        = flag.String("i", "", "")
+		out       = flag.String("o", "", "")
+		transform = flag.String("t", "", "")
 	)
 
 	flag.Parse()
 
-	err := run(*xml, *out, *path, *include, *exclude, flag.Args())
+	err := run(*in, *out, *transform)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
