@@ -7,11 +7,17 @@ import (
 	"encoding/xml"
 	"flag"
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/robertkrimen/otto"
 	"gopkg.in/xmlpath.v2"
-	"io"
-	"os"
-	"strings"
 )
 
 type transformExpression struct {
@@ -35,7 +41,7 @@ type transform struct {
 	path []string
 }
 
-func run(in, out, transformPath string) error {
+func run(in, out, transformPath string, append bool) error {
 	var err error
 
 	switch {
@@ -53,8 +59,8 @@ func run(in, out, transformPath string) error {
 	}
 	defer transformFile.Close()
 
-	var t transform
-	err = json.NewDecoder(transformFile).Decode(&t)
+	t := &transform{}
+	err = json.NewDecoder(transformFile).Decode(t)
 	if err != nil {
 		return fmt.Errorf("failed to parse json in %v: %v", transformPath, err)
 	}
@@ -88,8 +94,6 @@ func run(in, out, transformPath string) error {
 		}
 	}
 
-	fmt.Println(t)
-
 	xmlFile, err := os.Open(in)
 	if err != nil {
 		return fmt.Errorf("failed to open %v: %v", in, err)
@@ -98,7 +102,13 @@ func run(in, out, transformPath string) error {
 
 	var writer io.Writer
 	if out != "" {
-		outFile, err := os.Create(out)
+		outFileFlags := os.O_CREATE
+		if append {
+			outFileFlags |= os.O_APPEND
+		} else {
+			outFileFlags |= os.O_TRUNC
+		}
+		outFile, err := os.OpenFile(out, outFileFlags, 644)
 		if err != nil {
 			return fmt.Errorf("failed to create %v: %v", out, err)
 		}
@@ -113,37 +123,116 @@ func run(in, out, transformPath string) error {
 		headers[i] = t.Columns[i].Name
 	}
 
+	csvWriter := csv.NewWriter(writer)
+
+	if !append {
+		csvWriter.Write(headers)
+	}
+
+	wg := &sync.WaitGroup{}
+
+	processorCount := runtime.NumCPU()
+	xmlChan := make(chan []byte, processorCount)
+	csvChan := make(chan []string)
+	errChan := make(chan error)
+
+	cancelChan := make(chan struct{})
+
+	wg.Add(processorCount)
+	for i := 0; i < processorCount; i++ {
+		go process(t, xmlChan, csvChan, errChan, wg)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err = parse(xmlFile, t.path, func(xml []byte) error {
+			xmlCopy := make([]byte, len(xml))
+			copy(xmlCopy, xml)
+
+			xmlChan <- xmlCopy
+
+			select {
+			case <-cancelChan:
+				return fmt.Errorf("cancelled")
+			default:
+				return nil
+			}
+		})
+
+		if err != nil {
+			errChan <- err
+		}
+		close(xmlChan)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(csvChan)
+	}()
+
+loop:
+	for {
+		select {
+		case err = <-errChan:
+			close(cancelChan)
+			break loop
+
+		case csvLine, ok := <-csvChan:
+			if !ok {
+				break loop
+			}
+			err = csvWriter.Write(csvLine)
+			if err != nil {
+				break loop
+			}
+		}
+	}
+
+	if err != nil {
+		return err
+	}
+
+	csvWriter.Flush()
+
+	return nil
+}
+
+func process(t *transform, xmlChan <-chan []byte, csvChan chan<- []string, errChan chan error, wg *sync.WaitGroup) {
+	defer wg.Done()
+
 	jsvm := otto.New()
 
-	csvWriter := csv.NewWriter(writer)
-	csvWriter.Write(headers)
-
-	err = parse(xmlFile, t.path, func(xml []byte) error {
+loop:
+	for xml := range xmlChan {
 		node, err := xmlpath.Parse(bytes.NewReader(xml))
 		if err != nil {
-			return fmt.Errorf("failed to parse xml: %v", err)
+			errChan <- fmt.Errorf("failed to parse xml: %v", err)
+			return
 		}
 
 		include := len(t.Include) == 0
 		for i := 0; i < len(t.Include); i++ {
 			if include, err = evalBool(jsvm, node, &t.Include[i]); err != nil {
-				return fmt.Errorf("failed to eval include expression: %v", err)
+				errChan <- fmt.Errorf("failed to eval include expression: %v", err)
+				return
 			}
 			if include {
 				break
 			}
 		}
 		if !include {
-			return nil
+			continue loop
 		}
 
 		for i := 0; i < len(t.Exclude); i++ {
 			exclude, err := evalBool(jsvm, node, &t.Exclude[i])
 			if err != nil {
-				return fmt.Errorf("failed to eval exclude expression: %v", err)
+				errChan <- fmt.Errorf("failed to eval exclude expression: %v", err)
+				return
 			}
 			if exclude {
-				return nil
+				continue loop
 			}
 		}
 
@@ -151,25 +240,14 @@ func run(in, out, transformPath string) error {
 		for i := 0; i < len(t.Columns); i++ {
 			value, err := evalString(jsvm, node, &t.Columns[i].transformExpression)
 			if err != nil {
-				return fmt.Errorf("failed to eval column expression: %v", err)
+				errChan <- fmt.Errorf("failed to eval column expression: %v", err)
+				return
 			}
 			values[i] = strings.TrimSpace(value)
 		}
 
-		err = csvWriter.Write(values)
-		if err != nil {
-			return fmt.Errorf("failed to write to csv file: %v", err)
-		}
-		return nil
-	})
-
-	csvWriter.Flush()
-
-	if err != nil {
-		return err
+		csvChan <- values
 	}
-
-	return nil
 }
 
 func compile(expr *transformExpression) error {
@@ -300,14 +378,39 @@ func sliceEq(a, b []string) bool {
 
 func main() {
 	var (
-		in        = flag.String("i", "", "")
-		out       = flag.String("o", "", "")
-		transform = flag.String("t", "", "")
+		in         = flag.String("i", "", "")
+		out        = flag.String("o", "", "")
+		transform  = flag.String("t", "", "")
+		append     = flag.Bool("a", false, "")
+		cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+		memprofile = flag.String("memprofile", "", "write memory profile to file")
 	)
 
 	flag.Parse()
 
-	err := run(*in, *out, *transform)
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
+
+	if *memprofile != "" {
+		go func() {
+			time.Sleep(5 * time.Second)
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer f.Close()
+			pprof.Lookup("heap").WriteTo(f, 0)
+		}()
+	}
+
+	err := run(*in, *out, *transform, *append)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
