@@ -15,9 +15,9 @@ func (n *Names) IDFromName(name string) int {
 		id = len(n.names) - 1
 		n.nameToID[name] = id
 	}
-	return id
+	return id + 1
 }
 
 func (n *Names) NameFromID(id int) string {
-	return n.names[id]
+	return n.names[id-1]
 }
