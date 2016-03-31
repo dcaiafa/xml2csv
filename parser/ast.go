@@ -8,6 +8,13 @@ const (
 	OpMul
 	OpDiv
 	OpMod
+	OpLT
+	OpGT
+	OpEq
+	OpLE
+	OpGE
+	OpAnd
+	OpOr
 )
 
 type Order int
@@ -28,7 +35,7 @@ type Expr interface {
 }
 
 type Program struct {
-	Transforms []Transform
+	Transforms []*Transform
 }
 
 func (a *Program) Visit(visitor Visitor) {
@@ -40,14 +47,13 @@ func (a *Program) Visit(visitor Visitor) {
 }
 
 type Transform struct {
-	From   PathExpr
-	Where  Expr
-	Select []Column
+	Foreach []string
+	Where   Expr
+	Select  []*Column
 }
 
 func (a *Transform) Visit(visitor Visitor) {
 	visitor(Prefix, a)
-	a.From.Visit(visitor)
 	a.Where.Visit(visitor)
 	for _, c := range a.Select {
 		c.Visit(visitor)
@@ -61,6 +67,7 @@ type PathExpr struct {
 
 func (a *PathExpr) Visit(visitor Visitor) {
 	visitor(Prefix, a)
+	visitor(Postfix, a)
 }
 
 type Column struct {
@@ -105,4 +112,14 @@ type LiteralExpr struct {
 
 func (a *LiteralExpr) Visit(visitor Visitor) {
 	visitor(Prefix, a)
+	visitor(Postfix, a)
+}
+
+type CastExpr struct {
+	Expr AST
+}
+
+func (a *CastExpr) Visit(visitor Visitor) {
+	visitor(Prefix, a)
+	visitor(Postfix, a)
 }

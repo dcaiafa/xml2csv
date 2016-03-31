@@ -3,7 +3,11 @@ package parser
 
 import (
   "io"
+  "errors"
 )
+
+var ErrParserError = errors.New("failed to parse")
+
 %}
 
 %start program
@@ -13,15 +17,18 @@ import (
   res interface{}
 }
 
-%token FROM WHERE SELECT
+%token FOREACH WHERE SELECT
 
 %token <val> ID NUM STR PATH
 
 %token ':' '(' ')' ','
 
-%left '+' '-' '*' DIVOP '%'
+%left AND OR
+%left '<' '>' EQ LE GE
+%left '+' '-'
+%left '*' DIVOP '%'
 
-%type <res> program transforms transform fromClause whereClause whereClauseOpt 
+%type <res> program transforms transform foreachClause whereClause whereClauseOpt 
   selectClause columns column columnName expr pathExpr literalExpr callExpr
   callParamsOpt callParams binaryExpr
 
@@ -30,33 +37,33 @@ import (
 program:
   transforms
   {
-    $$ = $1
+    yylex.(*Lexer).Program = &Program{Transforms: $1.([]*Transform)}
   }
 
 transforms:
   transforms transform
   {
-    $$ = append($1.([]Transform), $2.(Transform))
+    $$ = append($1.([]*Transform), $2.(*Transform))
   }
 | transform
   {
-    $$ = []Transform{$1.(Transform)}
+    $$ = []*Transform{$1.(*Transform)}
   }
 
 transform:
-  fromClause whereClauseOpt selectClause
+  foreachClause whereClauseOpt selectClause
   {
     $$ = &Transform{
-      From:  $1.(PathExpr),
+      Foreach:  $1.([]string),
       Where: $2.(Expr),
-      Select: $3.([]Column),
+      Select: $3.([]*Column),
     }
   }
 
-fromClause:
-  FROM PATH
+foreachClause:
+  FOREACH PATH
   {
-    $$ = &PathExpr{Path: $2.Path}
+    $$ = $2.Path
   }
 
 whereClause:
@@ -83,11 +90,11 @@ selectClause:
 columns:
   columns ',' column
   {
-    $$ = append($1.([]Column), $3.(Column))
+    $$ = append($1.([]*Column), $3.(*Column))
   }
 | column
   {
-    $$ = []Column{$1.(Column)}
+    $$ = []*Column{$1.(*Column)}
   }
 
 column:
@@ -204,11 +211,70 @@ binaryExpr:
       Op:  OpMod,
     }
   }
+| expr '<' expr
+  {
+    $$ = &BinaryExpr{
+      LHS: $1.(Expr),
+      RHS: $3.(Expr),
+      Op:  OpLT,
+    }
+  }
+| expr '>' expr
+  {
+    $$ = &BinaryExpr{
+      LHS: $1.(Expr),
+      RHS: $3.(Expr),
+      Op:  OpGT,
+    }
+  }
+| expr EQ expr
+  {
+    $$ = &BinaryExpr{
+      LHS: $1.(Expr),
+      RHS: $3.(Expr),
+      Op:  OpEq,
+    }
+  }
+| expr LE expr
+  {
+    $$ = &BinaryExpr{
+      LHS: $1.(Expr),
+      RHS: $3.(Expr),
+      Op:  OpLE,
+    }
+  }
+| expr GE expr
+  {
+    $$ = &BinaryExpr{
+      LHS: $1.(Expr),
+      RHS: $3.(Expr),
+      Op:  OpGE,
+    }
+  }
+| expr AND expr
+  {
+    $$ = &BinaryExpr{
+      LHS: $1.(Expr),
+      RHS: $3.(Expr),
+      Op:  OpAnd,
+    }
+  }
+| expr OR expr
+  {
+    $$ = &BinaryExpr{
+      LHS: $1.(Expr),
+      RHS: $3.(Expr),
+      Op:  OpOr,
+    }
+  }
 
 %%
 
-func Parse(fileName string, reader io.Reader, names *Names) {
+func Parse(fileName string, reader io.Reader, names *Names) (*Program, error) {
   yyErrorVerbose = true
   l := NewLexer(fileName, reader, names)
-  yyParse(l)
+  if yyParse(l) != 0 {
+    return nil, ErrParserError
+  }
+  return l.Program, nil
 }

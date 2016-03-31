@@ -6,7 +6,10 @@ import (
 	"strconv"
 )
 
-func NFA2Dot(nfa *NFA) string {
+func nfaToDot(nfa *NFA, symToStr func(sym int) string) string {
+	if symToStr == nil {
+		symToStr = strconv.Itoa
+	}
 	buf := &bytes.Buffer{}
 	fmt.Fprintf(buf, "digraph G {")
 	fmt.Fprintf(buf, "  rankdir = \"LR\"; ")
@@ -24,7 +27,7 @@ func NFA2Dot(nfa *NFA) string {
 			if sym == Epsilon {
 				symName = "-eps-"
 			} else {
-				symName = strconv.Itoa(sym)
+				symName = symToStr(sym)
 			}
 
 			for _, destStateID := range destStateIDs {

@@ -25,6 +25,11 @@ const (
 	stateComment
 	stateFirstSlash
 	statePath
+	stateEq
+	stateAmp
+	stateBar
+	stateLeftAngle
+	stateRightAngle
 )
 
 type TokenValue struct {
@@ -38,6 +43,7 @@ type Lexer struct {
 	FileName string
 	Reader   *bufio.Reader
 	Names    *Names
+	Program  *Program
 
 	keywords map[string]int
 	buf      bytes.Buffer
@@ -46,7 +52,7 @@ type Lexer struct {
 
 func NewLexer(fileName string, reader io.Reader, names *Names) *Lexer {
 	keywords := make(map[string]int)
-	keywords["from"] = FROM
+	keywords["foreach"] = FOREACH
 	keywords["where"] = WHERE
 	keywords["select"] = SELECT
 
@@ -86,7 +92,6 @@ L:
 
 		switch state {
 		case stateStart:
-
 			switch r {
 			case ' ', '\t', '\r':
 				break
@@ -104,6 +109,21 @@ L:
 			case ':', '(', ')', ',', '+', '-', '*', '%':
 				tok = int(r)
 				break L
+
+			case '=':
+				state = stateEq
+
+			case '&':
+				state = stateAmp
+
+			case '|':
+				state = stateBar
+
+			case '<':
+				state = stateLeftAngle
+
+			case '>':
+				state = stateRightAngle
 
 			case '"':
 				state = stateStr
@@ -222,6 +242,51 @@ L:
 					break L
 				}
 			}
+
+		case stateEq:
+			if r != '=' {
+				l.Error(fmt.Sprintf("unexpected char %v", strconv.QuoteRune(r)))
+				return eof
+			}
+			tok = EQ
+			break L
+
+		case stateAmp:
+			if r != '&' {
+				l.Error(fmt.Sprintf("unexpected char %v", strconv.QuoteRune(r)))
+				return eof
+			}
+			tok = AND
+			break L
+
+		case stateBar:
+			if r != '|' {
+				l.Error(fmt.Sprintf("unexpected char %v", strconv.QuoteRune(r)))
+				return eof
+			}
+			tok = OR
+			break L
+
+		case stateLeftAngle:
+			if r == '=' {
+				tok = LE
+			} else {
+				tok = '<'
+				l.Reader.UnreadRune()
+			}
+			break L
+
+		case stateRightAngle:
+			if r == '=' {
+				tok = GE
+			} else {
+				tok = '>'
+				l.Reader.UnreadRune()
+			}
+			break L
+
+		default:
+			panic("not reached")
 		}
 	}
 

@@ -5,10 +5,15 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
 )
 
-func dfaToDot(dfa *DFA) string {
+func dfaToDot(dfa *DFA, symName func(sym int) string) string {
+	if symName == nil {
+		symName = strconv.Itoa
+	}
+
 	var buf bytes.Buffer
 	buf.WriteString("digraph G { rankdir=\"LR\"; ")
 	for stateID, state := range dfa.States {
@@ -25,7 +30,7 @@ func dfaToDot(dfa *DFA) string {
 		for _, sym := range syms {
 			toStateID := state.Trans[sym]
 			buf.WriteString(fmt.Sprintf("%v -> %v [label=\"%v\"]; ",
-				stateID, toStateID, sym))
+				stateID, toStateID, symName(sym)))
 		}
 	}
 	buf.WriteString("}")
@@ -106,7 +111,7 @@ func TestNFA2DFA(t *testing.T) {
 	nfa := buildTestNFA()
 
 	dfa := NFAToDFA(nfa)
-	dfaDot := dfaToDot(dfa)
+	dfaDot := dfaToDot(dfa, nil)
 
 	const expected = `digraph G { rankdir="LR"; 0 [shape="circle"]; 0 -> 1 [label="10"]; 0 -> 2 [label="20"]; 1 [shape="circle"]; 1 -> 1 [label="10"]; 1 -> 3 [label="20"]; 2 [shape="circle"]; 2 -> 1 [label="10"]; 2 -> 2 [label="20"]; 3 [shape="circle"]; 3 -> 1 [label="10"]; 3 -> 4 [label="20"]; 4 [shape="doublecircle"]; 4 -> 1 [label="10"]; 4 -> 2 [label="20"]; }`
 

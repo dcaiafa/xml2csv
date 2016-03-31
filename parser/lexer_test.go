@@ -114,7 +114,7 @@ func TestLexerPATH(t *testing.T) {
 }
 
 func TestLexerTokens(t *testing.T) {
-	l := newLexer(":(),+-*//%")
+	l := newLexer(":(),+-*//%==&&||<> <= >=")
 	expectToken(t, l, ':')
 	expectToken(t, l, '(')
 	expectToken(t, l, ')')
@@ -124,11 +124,18 @@ func TestLexerTokens(t *testing.T) {
 	expectToken(t, l, '*')
 	expectToken(t, l, DIVOP)
 	expectToken(t, l, '%')
+	expectToken(t, l, EQ)
+	expectToken(t, l, AND)
+	expectToken(t, l, OR)
+	expectToken(t, l, '<')
+	expectToken(t, l, '>')
+	expectToken(t, l, LE)
+	expectToken(t, l, GE)
 }
 
 func TestLexerKeywords(t *testing.T) {
-	l := newLexer("from where select")
-	expectToken(t, l, FROM)
+	l := newLexer("foreach where select")
+	expectToken(t, l, FOREACH)
 	expectToken(t, l, WHERE)
 	expectToken(t, l, SELECT)
 }
